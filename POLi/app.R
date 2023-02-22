@@ -1,41 +1,36 @@
-library(tidyverse)
+library(dplyr)
+library(stringr)
+library(magrittr)
 library(plotly)
 library(shiny)
 library(tfdeploy)
 library(keras)
 library(shinyjs)
+library(stopwords)
+library(SnowballC)
 
 
 label_mapping <- readRDS("www/label_mapping.rds")
-tokenizer <- load_text_tokenizer("www/ideology_pred_tokenizer")
+tokenizer <- load_text_tokenizer("www/tokenizer")
 
-clean_text <- function(input, col){
-
-  loop_dfr <- function(x){
-    row_i <- input[x,col]
-    #turn to lower case
-    row_i <- tolower(row_i)
-    #remove punctuation
-    row_i <- stringr::str_replace_all(row_i,"[[:punct:]]+", " ")
-    #remove numbers
-    row_i <- stringr::str_replace_all(row_i,"[[:digit:]]+", " ")
-    #trim white space on ends of string
-    row_i <- trimws(row_i, which = "both")
-    #shrink multiple white space to one
-    row_i <- stringr::str_replace_all(row_i, "[\\s]+", " ")
-    df <- data.frame("text" = row_i)
-    return(df)
+clean_text <- function(data, cols) {
+  
+  for(i in 1:length(cols)) {
+    data[[cols[i]]] <- data[[cols[i]]] %>%
+      tolower() %>%
+      stringr::str_replace_all("[^[:alnum:] ]+", " ") %>%
+      stringr::str_replace_all("[[:digit:]]+", " ") %>%
+      trimws(which = "both") %>%
+      stringr::str_replace_all("[\\s]+", " ") %>%
+      strsplit(.," ") %>%
+      {
+        stopwords <- stopwords::stopwords("de", source = "snowball")
+        lapply(., function(i) paste(SnowballC::wordStem(i[!i %in% stopwords],"german"), collapse = " ")) %>%
+          unlist()
+      } 
   }
-  out <- purrr::map_dfr(1:nrow(input), ~loop_dfr(.x))
-  return(out)
-}
-
-transform <- function(list){
-  loop <- function(x){
-    el_i <- as.data.frame(t(list[[x]][[1]]))
-    return(el_i)
-  }
-  out <- purrr::map_dfr(1:length(list), ~loop(.x))
+  
+  return(data)
 }
 
 analysis <- function(analysis_input, prog = NULL){
@@ -45,14 +40,11 @@ analysis <- function(analysis_input, prog = NULL){
     prog(detail = text)
   }
 
-  text <- as.data.frame(unlist(strsplit(analysis_input, "\\.")))
-  text <- clean_text(input = text, col = 1)
-  text <- text%>%
-    dplyr::select(., c(text))%>%
-    pull()
-
+  text <- as.data.frame(unlist(strsplit(analysis_input, "\\."))) 
+  text <- clean_text(data = text, col = 1)[[1]]
+  
   sequences <- keras::texts_to_sequences(tokenizer, text)
-  input_text <- keras::pad_sequences(sequences, maxlen = 100)
+  input_text <- keras::pad_sequences(sequences, maxlen = 45)
   input_text <- asplit(input_text,1)
 
   if (is.function(prog)) {
@@ -60,16 +52,20 @@ analysis <- function(analysis_input, prog = NULL){
     prog(detail = text)
   }
 
-  results <- tfdeploy::predict_savedmodel(input_text, "www/savedmodel/")
-  results <- transform(list = results[[1]])
-
+  results <- tfdeploy::predict_savedmodel(input_text, "www/saved_model/poli_model")$predictions %>%
+    lapply(., function(i) t(as.vector(i[[1]]))) %>%
+    do.call(rbind, .) %>%
+    as.data.frame()
+  
   colnames(results) <- as.character(label_mapping$label)
-  results <- results%>%
-    dplyr::summarise_all(., mean)
-  results <- tidyr::pivot_longer(results, c(1:27))
-  results <- merge(results, label_mapping, by.x = "name", by.y = "label")
-  results <- results%>%
-    dplyr::rename(., probability = value)
+  results <- results %>%
+    dplyr::summarise_all(., mean) %>%
+    tidyr::pivot_longer(c(1:27)) %>%
+    dplyr::rename(label = name,
+                  probability = value) %>%
+    dplyr::left_join(., label_mapping, by = "label") %>%
+    dplyr::mutate(name = gsub("_", " ", label))
+  
 
   plot <- ggplot(data = results, aes(x = reorder(name, probability), y = probability, label = description))+
     geom_bar(stat = "identity")+
@@ -84,34 +80,57 @@ analysis <- function(analysis_input, prog = NULL){
 
 ui <- navbarPage(
   "POLi (beta 0.1.0)",
-  tabPanel("Analysis",
-           useShinyjs(),
-           div(
-           textAreaInput("text_input",label = NULL, width = "4000px", height = "100px", placeholder = "enter your text...",
-                         resize = "none")
-           ),
-           actionButton("run","Analyze"),
-           actionButton("clear","Clear"),
-           plotlyOutput("plotly_out", width = "75%")
-
+  tabPanel(
+    "Analysis",
+    useShinyjs(),
+    fluidRow(
+      wellPanel(
+        column(12, align = "center",
+               textAreaInput(
+                 "text_input",
+                 label = NULL,
+                 width = "4000px",
+                 height = "100px",
+                 placeholder = "enter your text...",
+                 resize = "none"
+                 )
+               ),
+        actionButton("run","Analyze"),
+        actionButton("clear","Clear")
+      )
+    ),
+    fluidRow(
+      column(12, align = "center",
+            wellPanel(
+              plotlyOutput("plotly_out", width = "75%") 
+            )
+          )
+    )
   ),
-  tabPanel("About",
-             "POLi is a natural language processing model designed to predict the ideological position
-             expressed in german political text. It utilizes custom word embeddings fed into a CNN LSTM
+  tabPanel(
+    "About",
+    fluidRow(
+      wellPanel(
+        "POLi is an experimental natural language processing model designed to predict the ideological position
+             expressed in german political text. It utilizes custom word embeddings fed into a CNN
              neural network architecture to generate ideology predictions. POLi was trained on ideology
-             labeled german party manifesto text data from The Manifesto Project [1]. As the data set used to
-             train POLi is comparitively small (by machine learning standards) and domain specific, the model
-             will likely not generalize well beyond the immediate context of german political texts (i.e. parliamentary bills,
-             policy proposals, parliamentary inquiries etc.). Within this domain; however, initial tests indicate promising performance.",
-             tags$footer("[1] Volkens, Andrea / Burst, Tobias / Krause, Werner / Lehmann, Pola / Matthiess Theres / Merz, Nicolas / Regel, Sven / Wessels, Bernhard / Zehnter, Lisa (2020): The Manifesto Data Collection. Manifesto Project (MRG/CMP/MARPOR). Version 2020b. Berlin: Wissenschaftszentrum Berlin fuer Sozialforschung (WZB).",
-             align = "left", style = "
+             labeled german party manifesto text data from The Manifesto Project ¹. As the data set used to
+             train POLi is comparitively small and domain specific, the model will likely not generalize well beyond the immediate context of german political texts (i.e. parliamentary bills,
+             policy proposals, parliamentary inquiries etc.). Within this domain; however, initial tests indicate promising performance."
+      ),
+      tags$footer(
+        "¹ Volkens, Andrea / Burst, Tobias / Krause, Werner / Lehmann, Pola / Matthiess Theres / Merz, Nicolas / Regel, Sven / Wessels, Bernhard / Zehnter, Lisa (2020): The Manifesto Data Collection. Manifesto Project (MRG/CMP/MARPOR). Version 2020b. Berlin: Wissenschaftszentrum Berlin fuer Sozialforschung (WZB).",
+        align = "left",
+        style = "
               position:absolute;
               bottom:0;
               width:100%;
               height:50px;
               color: black;
               padding: 10px;
-              z-index: 1000;")
+              z-index: 1000;"
+      )
+    )
   )
 )
 
