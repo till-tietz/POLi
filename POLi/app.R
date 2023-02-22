@@ -46,7 +46,71 @@ analysis <- function(analysis_input, prog = NULL){
   sequences <- keras::texts_to_sequences(tokenizer, text)
   input_text <- keras::pad_sequences(sequences, maxlen = 45)
   input_text <- asplit(input_text,1)
+  
+  text <- as.data.frame(unlist(strsplit(analysis_input, "\\."))) 
+  text <- clean_text(data = text, col = 1)[[1]]
+  
+  sequences <- keras::texts_to_sequences(tokenizer, text)
+  input_text <- keras::pad_sequences(sequences, maxlen = 45)
+  input_text <- asplit(input_text,1)
+  
+  if (is.function(prog)) {
+    text <- "computing predictions"
+    prog(detail = text)
+  }
+  
+  results <- tfdeploy::predict_savedmodel(input_text, "www/saved_model/poli_model")$predictions %>%
+    lapply(., function(i) t(as.vector(i[[1]]))) %>%
+    do.call(rbind, .) %>%
+    as.data.frame()
+  
+  colnames(results) <- as.character(label_mapping$label)
+  results <- results %>%
+    dplyr::summarise_all(., mean) %>%
+    tidyr::pivot_longer(c(1:27)) %>%
+    dplyr::rename(label = name,
+                  probability = value) %>%
+    dplyr::left_join(., label_mapping, by = "label") %>%
+    dplyr::mutate(name = gsub("_", " ", label))
+  
+  
+  plot <- ggplot(data = results, aes(x = reorder(name, probability), y = probability, label = description))+
+    geom_bar(stat = "identity")+
+    scale_y_continuous(limits = c(0,1), expand = c(0,0))+
+    ylab("Classification Probability")+
+    coord_flip()+
+    theme_bw()+
+    theme(axis.title.y = element_blank())
+  return(plot)
+}
 
+
+ui <- navbarPage(
+  "POLi (beta 0.1.0)",
+  tabPanel(
+    "Analysis",
+    useShinyjs(),
+    fluidRow(
+      wellPanel(
+        column(12, align = "center",
+               textAreaInput(
+                 "text_input",
+                 label = NULL,
+                 width = "4000px",
+                 height = "100px",
+                 placeholder = "enter your text...",
+                 resize = "none"
+               )
+        ),
+        actionButton("run","Analyze"),
+        actionButton("clear","Clear")
+      )
+    ),
+    fluidRow(
+      column(12, align = "center",
+             wellPanel(
+               plotlyOutput("plotly_out", width = "75%") 
+             )
   if (is.function(prog)) {
     text <- "computing predictions"
     prog(detail = text)
